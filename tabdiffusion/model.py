@@ -79,7 +79,7 @@ class TabDiffusionGenerator(nn.Module):
 
         # output projector and decoders
         self.out_proj = nn.Linear(token_dim, token_dim)
-        self.num_decoders = nn.ModuleList([nn.Linear(token_dim, 1) for _ in range(num_numeric)])
+        self.num_decoders = nn.ModuleList([nn.Linear(token_dim, 2) for _ in range(num_numeric)])
         self.cat_decoders = nn.ModuleList([nn.Linear(token_dim, card) for card in cat_cardinalities])
 
         # noise schedule (cosine)
