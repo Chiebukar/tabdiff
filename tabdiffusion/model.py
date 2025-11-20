@@ -222,8 +222,9 @@ class TabDiffusionGenerator(nn.Module):
         cat_outs = []
         offset = 1 + self.num_num
         for i, dec in enumerate(self.cat_decoders):
-            logits = dec(toks[:, offset + i])
-            idx = torch.argmax(logits, dim=-1)
+            logits = dec(toks[:, offset + i])           # [B, card]
+            probs = torch.softmax(logits / 1.0, dim=-1) # temperature=1.0 (can be parameterized)
+            idx = torch.multinomial(probs, 1).squeeze(1)
             cat_outs.append(idx)
         x_cat_gen = torch.stack(cat_outs, dim=1) if len(cat_outs) > 0 else torch.zeros(B, 0, dtype=torch.long, device=device)
         return x_num_gen, x_cat_gen
