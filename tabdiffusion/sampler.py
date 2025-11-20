@@ -1,77 +1,124 @@
 # tabdiffusion/sampler.py
 """
-Sampling helper that provides high-level functions to build cond_batch,
-perform target-distribution sampling, feature-biasing, and return DataFrame.
+Helper sampling utilities used by the high-level TabDiffusion wrapper.
+
+Provides:
+- functions to build cond_batch for sampling (empirical marginals / overrides)
+- decode generated tensors to pandas DataFrame with original column names
 """
 
-import torch
+from typing import Dict, List, Optional
 import numpy as np
+import torch
 import pandas as pd
 
-def _build_cond_batch(gen, num_samples, cond_overrides, device):
+
+def build_cond_batch_from_overrides(
+    cond_specs: Dict[str, Dict],
+    num_samples: int,
+    cond_overrides: Optional[Dict] = None,
+    empirical_cond_probs: Optional[Dict[str, pd.Series]] = None,
+    label_encoders: Optional[Dict[str, object]] = None,
+    device: str = "cpu"
+) -> Dict[str, torch.Tensor]:
     """
-    Build cond_batch dict (col -> tensor of shape (num_samples,))
-    cond_overrides may contain scalar value or list/ndarray (length==num_samples).
+    Build cond_batch dict mapping cond_name -> torch.tensor(shape=(num_samples,)) to feed model.sample().
+    If an override is provided for a column, use that; otherwise sample from empirical_cond_probs (if provided)
+    or fall back to zeros.
     """
-    cond_batch = {}
-    for col, spec in gen.cond_specs.items():
-        typ = spec["type"]
-        if cond_overrides and col in cond_overrides:
+    cond_overrides = cond_overrides or {}
+    empirical_cond_probs = empirical_cond_probs or {}
+    device = torch.device(device) if isinstance(device, str) else device
+
+    batch = {}
+    for col, spec in cond_specs.items():
+        typ = spec.get("type")
+        if col in cond_overrides:
             val = cond_overrides[col]
-            if isinstance(val, (list, np.ndarray, torch.Tensor)):
-                arr = np.array(val)
-                if arr.shape[0] != num_samples:
-                    raise ValueError(f"cond override length for {col} must equal num_samples or be scalar")
-                if typ in ("cat","binary"):
-                    cond_batch[col] = torch.tensor(arr, dtype=torch.long, device=device)
+            # categorical string -> index via label_encoders if possible
+            if typ == "cat":
+                if isinstance(val, str) and label_encoders and col in label_encoders:
+                    idx = int(label_encoders[col].transform([val])[0])
+                    batch[col] = torch.full((num_samples,), idx, dtype=torch.long, device=device)
+                elif isinstance(val, (list, np.ndarray)):
+                    arr = np.array(val)
+                    if arr.shape[0] == num_samples:
+                        batch[col] = torch.tensor(arr.astype(int), dtype=torch.long, device=device)
+                    else:
+                        # broadcast scalar
+                        batch[col] = torch.full((num_samples,), int(arr.ravel()[0]), dtype=torch.long, device=device)
                 else:
-                    cond_batch[col] = torch.tensor(arr, dtype=torch.float32, device=device)
-            else:
-                if typ in ("cat","binary"):
-                    cond_batch[col] = torch.full((num_samples,), int(val), dtype=torch.long, device=device)
+                    batch[col] = torch.full((num_samples,), int(val), dtype=torch.long, device=device)
+            elif typ == "binary":
+                batch[col] = torch.full((num_samples,), int(val), dtype=torch.long, device=device)
+            else:  # numeric
+                if isinstance(val, (list, np.ndarray)):
+                    arr = np.array(val).astype(float)
+                    if arr.shape[0] == num_samples:
+                        batch[col] = torch.tensor(arr, dtype=torch.float32, device=device)
+                    else:
+                        batch[col] = torch.full((num_samples,), float(arr.ravel()[0]), dtype=torch.float32, device=device)
                 else:
-                    cond_batch[col] = torch.full((num_samples,), float(val), dtype=torch.float32, device=device)
+                    batch[col] = torch.full((num_samples,), float(val), dtype=torch.float32, device=device)
         else:
-            # default zeros (classifier-free guidance may mask cond)
-            if typ in ("cat","binary"):
-                cond_batch[col] = torch.zeros(num_samples, dtype=torch.long, device=device)
+            # sample from empirical distribution if available
+            if typ in ("cat", "binary"):
+                probs = empirical_cond_probs.get(col, None)
+                if probs is not None:
+                    choices = probs.index.to_numpy()
+                    p = probs.values.astype(float)
+                    idxs = np.random.choice(choices, size=num_samples, p=p)
+                    batch[col] = torch.tensor(idxs.astype(int), dtype=torch.long, device=device)
+                else:
+                    batch[col] = torch.zeros(num_samples, dtype=torch.long, device=device)
             else:
-                cond_batch[col] = torch.zeros(num_samples, dtype=torch.float32, device=device)
-    return cond_batch
+                stats = empirical_cond_probs.get(col, None)
+                if stats is not None and isinstance(stats, dict) and "mean" in stats:
+                    mu = float(stats["mean"])
+                    sigma = float(stats.get("std", 1.0))
+                    vals = np.random.normal(loc=mu, scale=sigma, size=num_samples)
+                    batch[col] = torch.tensor(vals, dtype=torch.float32, device=device)
+                else:
+                    batch[col] = torch.zeros(num_samples, dtype=torch.float32, device=device)
+    return batch
 
-def generate_targeted_samples(gen, num_samples, target_col, labels_to_sample, proportions, cond_overrides, steps, cfg_scale, device, preprocessor):
+
+def decode_generated_to_df(
+    x_num_gen: np.ndarray,
+    x_cat_gen: np.ndarray,
+    num_col_names: List[str],
+    cat_col_names: List[str],
+    scaler=None,
+    label_encoders: Optional[Dict[str, object]] = None
+) -> pd.DataFrame:
     """
-    Generate samples split across labels_to_sample per proportions (list sums to 1).
-    Returns DataFrame in original schema including target column.
+    Decode generated numeric & categorical arrays into pandas DataFrame.
+    - x_num_gen: [B, num_num] floats (in scaled space if scaler provided)
+    - x_cat_gen: [B, num_cat] int indices
+    - scaler: fitted scaler with .inverse_transform
+    - label_encoders: dict col->LabelEncoder for inverse mapping
     """
-    device = torch.device(device)
-    parts = []
-    # Determine counts
-    counts = []
-    if len(labels_to_sample) == 1:
-        counts = [num_samples]
+    if scaler is not None and x_num_gen.size > 0:
+        try:
+            x_num_orig = scaler.inverse_transform(x_num_gen)
+        except Exception:
+            x_num_orig = x_num_gen
     else:
-        counts = [int(num_samples * p) for p in proportions]
-        # adjust rounding
-        diff = num_samples - sum(counts)
-        for i in range(diff):
-            counts[i % len(counts)] += 1
+        x_num_orig = x_num_gen
 
-    for label, cnt in zip(labels_to_sample, counts):
-        if cnt <= 0:
+    df = pd.DataFrame(x_num_orig, columns=num_col_names) if x_num_orig.size > 0 else pd.DataFrame()
+
+    # decode categorical indices back to labels (if label_encoders provided)
+    for i, col in enumerate(cat_col_names):
+        if x_cat_gen.size == 0 or x_cat_gen.shape[1] <= i:
+            df[col] = pd.NA
             continue
-        # build overrides plus target
-        co = dict(cond_overrides or {})
-        co[target_col] = int(label)
-        cond_batch = _build_cond_batch(gen, cnt, co, device)
-        x_num_gen, x_cat_gen = gen.sample(cnt, cond_batch, steps=steps, cfg_scale=cfg_scale)
-        # inverse transform to DataFrame rows
-        X_num_np = x_num_gen.detach().cpu().numpy()
-        X_cat_np = x_cat_gen.detach().cpu().numpy() if x_cat_gen.numel() > 0 else np.zeros((cnt, 0), dtype=int)
-        df_part = preprocessor.inverse_transform(X_num_np, X_cat_np)
-        # attach target (preserve original raw label if preprocessor target permutes—here we keep numeric)
-        df_part[target_col] = label
-        parts.append(df_part)
-    if len(parts) == 0:
-        return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True)
+        idxs = x_cat_gen[:, i].astype(int)
+        if label_encoders and col in label_encoders:
+            try:
+                df[col] = label_encoders[col].inverse_transform(idxs)
+            except Exception:
+                df[col] = idxs
+        else:
+            df[col] = idxs
+    return df
