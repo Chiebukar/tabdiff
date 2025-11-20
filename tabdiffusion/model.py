@@ -217,8 +217,15 @@ class TabDiffusionGenerator(nn.Module):
             toks = toks_cond
 
         # decode
-        num_outs = [dec(toks[:, 1 + i]) for i, dec in enumerate(self.num_decoders)]
-        x_num_gen = torch.cat(num_outs, dim=1) if len(num_outs) > 0 else torch.zeros(B, 0, device=device)
+        num_vals = []
+        for i, dec in enumerate(self.num_decoders):
+            out = dec(toks[:, 1 + i])     # [B, 2]
+            mu, logvar = out[:, 0], out[:, 1]
+            std = (0.5 * logvar).exp()
+            sample = mu + std * torch.randn_like(mu)
+            num_vals.append(sample.unsqueeze(1))
+
+        x_num_gen = torch.cat(num_vals, dim=1)
         cat_outs = []
         offset = 1 + self.num_num
         for i, dec in enumerate(self.cat_decoders):
