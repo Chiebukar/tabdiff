@@ -141,3 +141,14 @@ def log_loss(epoch, train_loss, val_loss):
         None
     """
     print(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+
+
+def sanitize_categoricals(df):
+    """
+    Convert pandas Categorical columns to strings so that
+    new-category errors do not appear during preprocessing.
+    """
+    for col in df.columns:
+        if pd.api.types.is_categorical_dtype(df[col]):
+            df[col] = df[col].astype(str)
+    return df

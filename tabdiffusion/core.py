@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from .model import TabDiffusionGenerator
 from .data import TabularDataset
 from .sampler import build_cond_batch_from_overrides, decode_generated_to_df
+from .utils import sanitize_categoricals 
 
 
 class TabDiffusion:
@@ -42,7 +43,7 @@ class TabDiffusion:
         - target: name of the target column (optional)
         - conditionals: list of column names to use as conditioning (categorical or numeric). If None, default to all categorical columns.
         """
-        self.df_raw = df.copy()
+        self.df_raw = sanitize_categoricals(df.copy())
         self.target = target
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.verbose = verbose
