@@ -290,8 +290,9 @@ class TabDiffusion:
 
         # limit extreme outliers for numeric stability
         for col in self.num_cols:
-            lo,hi = self.df_prepared[col].quantile([0.001,0.999])
-            df[col]=df[col].clamp(lo,hi)
+            if col in df.columns and col in self.df_prepared.columns:
+                lo, hi = self.df_prepared[col].quantile([0.001, 0.999]).values
+                df[col] = df[col].clip(lo, hi)
 
         return df
 
