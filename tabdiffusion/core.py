@@ -9,8 +9,6 @@ Usage example:
 """
 
 import os
-import math
-import json
 import numpy as np
 import pandas as pd
 from typing import List, Optional, Dict, Tuple
@@ -41,115 +39,116 @@ class TabDiffusion:
         High level API that prepares data, fits TabDiffusionGenerator, and samples.
         - df: raw pandas DataFrame (will be copied internally)
         - target: name of the target column (optional)
-        - conditionals: list of column names to use as conditioning (categorical or numeric). If None, default to all categorical columns.
+        - conditionals: list of column names to use as conditioning (categorical or numeric). 
+                        If None, default uses all categorical columns.
         """
         self.df_raw = sanitize_categoricals(df.copy())
         self.target = target
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.verbose = verbose
 
-        # determine numeric and categorical columns automatically
-        self.num_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
-        if target is not None and target in self.num_cols:
-            self.num_cols = [c for c in self.num_cols if c != target]
+        # detect numeric vs categorical
+        self.num_cols = df.select_dtypes(include=["int64", "float64", "float32"]).columns.tolist()
+        if target in self.num_cols:
+            self.num_cols.remove(target)
+
         self.cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
 
-        # choose conditionals default -> all categorical cols if not provided
-        if conditionals is None:
-            self.cond_cols = [c for c in self.cat_cols]
-        else:
-            self.cond_cols = conditionals
+        # conditionals
+        self.cond_cols = conditionals if conditionals else list(self.cat_cols)
 
-        # placeholders for fitted transformers / encoders
+        # containers
         self.scaler = None
         self.label_encoders: Dict[str, LabelEncoder] = {}
-        self.cond_empirical_probs: Dict[str, pd.Series] = {}  # for categorical cond sampling
-        self.cond_empirical_stats: Dict[str, Dict] = {}        # for numeric cond sampling (mean/std)
-        self.model: Optional[TabDiffusionGenerator] = None
-        self.train_history = {"train_loss": [], "val_loss": []}
+        self.cond_empirical_probs = {}   # categorical distributions
+        self.cond_empirical_stats = {}   # numeric mean/std
+
+        self.model = None
         self.checkpoint_path = None
 
+        # <-- UPDATED: tracked losses -->
+        self.train_losses = []
+        self.val_losses = []
+        self.history = {}
+        self.best_val_loss = None
+    # ---------------------------------------------------------------
+
+
     def _prepare(self):
-        """Fit encoders and scaler, label-encode categoricals in a copy of dataframe."""
+        """Fit encoders + scaler and produce encoded training frame."""
         df = self.df_raw.copy()
 
-        # fill missing
         df[self.num_cols] = df[self.num_cols].fillna(0.0)
         df[self.cat_cols] = df[self.cat_cols].fillna("NA")
 
-        # fit label encoders for categorical columns
         for c in self.cat_cols:
             le = LabelEncoder()
-            df[c] = le.fit_transform(df[c].astype(str).values)
+            df[c] = le.fit_transform(df[c].astype(str))
             self.label_encoders[c] = le
 
-        # fit scaler for numerics (Robust to outliers)
         if len(self.num_cols) > 0:
             self.scaler = RobustScaler()
-            self.scaler.fit(df[self.num_cols].values)
+            self.scaler.fit(df[self.num_cols])
 
-        # compute empirical conditional distributions
+        # compute empirical conditional priors
         for col in self.cond_cols:
             if col in self.cat_cols:
-                counts = df[col].value_counts(normalize=True)
-                # index contains integer class labels (already encoded)
-                self.cond_empirical_probs[col] = counts
+                self.cond_empirical_probs[col] = df[col].value_counts(normalize=True)
             elif col in self.num_cols:
-                self.cond_empirical_stats[col] = {"mean": float(df[col].mean()), "std": float(df[col].std())}
+                self.cond_empirical_stats[col] = {"mean": df[col].mean(), "std": df[col].std()}
 
         self.df_prepared = df
 
-    def _make_dataset_loaders(self, batch_size: int = 128, val_split: float = 0.2, balance: bool = True, random_state: int = 42):
+
+    def _make_dataset_loaders(self, batch_size=128, val_split=0.2, balance=True, seed=42):
         df = self.df_prepared.reset_index(drop=True)
-        train_df, val_df = train_test_split(df, test_size=val_split, random_state=random_state, stratify=(df[self.target] if self.target in df.columns else None))
+
+        y = df[self.target] if self.target in df.columns else None
+        train_df, val_df = train_test_split(df, test_size=val_split,
+                        stratify=y if y is not None else None, random_state=seed)
 
         train_ds = TabularDataset(train_df, self.num_cols, self.cat_cols, label_col=self.target, scaler=self.scaler)
-        val_ds = TabularDataset(val_df, self.num_cols, self.cat_cols, label_col=self.target, scaler=self.scaler)
+        val_ds   = TabularDataset(val_df,   self.num_cols, self.cat_cols, label_col=self.target, scaler=self.scaler)
 
-        if balance and (self.target is not None) and (self.target in df.columns):
+        if balance and self.target in df.columns:
             labels = train_df[self.target]
-            class_counts = labels.value_counts().to_dict()
-            weights = labels.map(lambda x: 1.0 / class_counts[x]).values
+            weights = 1 / labels.value_counts()[labels].values
             sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
             train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler)
         else:
             train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-        return train_loader, val_loader
+        return train_loader, DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
 
     def fit(
         self,
-        epochs: int = 50,
-        batch_size: int = 256,
-        lr: float = 1e-4,
-        transformer_layers: int = 4,
-        transformer_heads: int = 4,
-        transformer_ff: int = 512,
-        token_dim: int = 192,
-        uncond_prob: float = 0.1,
-        patience: int = 10,
-        checkpoint_path: str = "tabdiff_best.pt",
-        balance: bool = True
-    ) -> Tuple[List[float], List[float]]:
-        """
-        Fit the TabDiffusion model on the prepared dataframe.
-        Returns: train_losses, val_losses (lists)
-        """
+        epochs=50,
+        batch_size=256,
+        lr=1e-4,
+        transformer_layers=4,
+        transformer_heads=4,
+        transformer_ff=512,
+        token_dim=192,
+        uncond_prob=0.1,
+        patience=10,
+        checkpoint_path="tabdiff_best.pt",
+        balance=True
+    ):
         self._prepare()
-        train_loader, val_loader = self._make_dataset_loaders(batch_size=batch_size, val_split=0.2, balance=balance)
+        train_loader, val_loader = self._make_dataset_loaders(batch_size, balance=balance)
 
-        # prepare model
+        # model setup
         cat_cardinalities = [len(self.label_encoders[c].classes_) for c in self.cat_cols]
-        # cond_columns format: {name: {"type": "cat"/"num"/"binary", "cardinality": int (if cat)}}
-        cond_specs = {}
-        for col in self.cond_cols:
-            if col in self.cat_cols:
-                cond_specs[col] = {"type": "cat", "cardinality": len(self.label_encoders[col].classes_)}
-            elif col in self.num_cols:
-                cond_specs[col] = {"type": "num"}
 
-        device = torch.device(self.device)
+        cond_specs = {}
+        for c in self.cond_cols:
+            if c in self.cat_cols:
+                cond_specs[c] = {"type": "cat", "cardinality": len(self.label_encoders[c].classes_)}
+            else:
+                cond_specs[c] = {"type": "num"}
+
+        dev = torch.device(self.device)
         self.model = TabDiffusionGenerator(
             num_numeric=len(self.num_cols),
             cat_cardinalities=cat_cardinalities,
@@ -159,170 +158,140 @@ class TabDiffusion:
             transformer_heads=transformer_heads,
             transformer_ff=transformer_ff,
             uncond_prob=uncond_prob
-        ).to(device)
+        ).to(dev)
 
         opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-6)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs), eta_min=1e-6)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
-        best_val = float("inf")
-        patience_counter = 0
+        best_val = np.inf
+        patience_ctr = 0
         self.checkpoint_path = checkpoint_path
 
-        self.train_history = {"train_loss": [], "val_loss": []}
+        self.train_losses, self.val_losses = [], []  # <-- RESET cleanly
 
-        for epoch in range(1, epochs + 1):
-            # training
+        # ------------------ Training Loop ------------------
+        for ep in range(1, epochs + 1):
+
             self.model.train()
-            train_losses = []
+            tr_loss = []
             for x_num, x_cat, y in train_loader:
-                x_num = x_num.to(device)
-                x_cat = x_cat.to(device)
-                # build cond_batch from batch values (for conditionals that are categorical numeric in cat_cols order)
-                cond_batch = {}
+                x_num, x_cat = x_num.to(dev), x_cat.to(dev)
+
+                cond = {}
                 for col in self.cond_cols:
-                    if col in self.cat_cols:
-                        idx = self.cat_cols.index(col)
-                        cond_batch[col] = x_cat[:, idx].to(device)
-                    elif col in self.num_cols:
-                        idx = self.num_cols.index(col)
-                        cond_batch[col] = x_num[:, idx].to(device)
+                    cond[col] = x_cat[:, self.cat_cols.index(col)].to(dev) if col in self.cat_cols \
+                                else x_num[:, self.num_cols.index(col)].to(dev)
 
-                loss = self.model.training_loss(x_num, x_cat, cond_batch)
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                train_losses.append(loss.item())
+                loss = self.model.training_loss(x_num, x_cat, cond)
+                opt.zero_grad(); loss.backward(); opt.step()
+                tr_loss.append(loss.item())
 
-            avg_train = float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0
-            self.train_history["train_loss"].append(avg_train)
+            avg_train = np.mean(tr_loss)
+            self.train_losses.append(avg_train)
 
-            # validation
+            # ------------------ Validation ------------------
             self.model.eval()
-            val_losses = []
+            vloss = []
             with torch.no_grad():
                 for x_num, x_cat, y in val_loader:
-                    x_num = x_num.to(device)
-                    x_cat = x_cat.to(device)
-                    cond_batch = {}
+                    x_num, x_cat = x_num.to(dev), x_cat.to(dev)
+
+                    cond = {}
                     for col in self.cond_cols:
-                        if col in self.cat_cols:
-                            idx = self.cat_cols.index(col)
-                            cond_batch[col] = x_cat[:, idx].to(device)
-                        elif col in self.num_cols:
-                            idx = self.num_cols.index(col)
-                            cond_batch[col] = x_num[:, idx].to(device)
-                    vloss = self.model.training_loss(x_num, x_cat, cond_batch)
-                    val_losses.append(vloss.item())
-            avg_val = float(np.mean(val_losses)) if len(val_losses) > 0 else 0.0
-            self.train_history["val_loss"].append(avg_val)
+                        cond[col] = x_cat[:, self.cat_cols.index(col)].to(dev) if col in self.cat_cols \
+                                    else x_num[:, self.num_cols.index(col)].to(dev)
+
+                    vloss.append(self.model.training_loss(x_num, x_cat, cond).item())
+
+            avg_val = np.mean(vloss)
+            self.val_losses.append(avg_val)
 
             if self.verbose:
-                print(f"[Epoch {epoch}/{epochs}] train_loss={avg_train:.6f} val_loss={avg_val:.6f}")
+                print(f"[{ep}/{epochs}] Train={avg_train:.6f} | Val={avg_val:.6f}")
 
-            scheduler.step()
+            sched.step()
 
-            # checkpoint
+            # Best checkpoint
             if avg_val < best_val:
                 best_val = avg_val
-                patience_counter = 0
+                patience_ctr = 0
                 torch.save(self.model.state_dict(), checkpoint_path)
-                if self.verbose:
-                    print("Saved new best checkpoint:", checkpoint_path)
+                if self.verbose: print("↳ Saved new best checkpoint.")
             else:
-                patience_counter += 1
+                patience_ctr += 1
+                if patience_ctr >= patience:
+                    print("Early Stopping.")
+                    break
 
-            if patience_counter >= patience:
-                if self.verbose:
-                    print("Early stopping triggered.")
-                break
+        self.best_val_loss = best_val
+        self.history = {"train_loss": self.train_losses, "val_loss": self.val_losses}
 
-        # load best model automatically
-        if os.path.exists(self.checkpoint_path):
-            self.model.load_state_dict(torch.load(self.checkpoint_path, map_location=device))
-            if self.verbose:
-                print("Loaded best model from", self.checkpoint_path)
-        return self.train_history["train_loss"], self.train_history["val_loss"]
+        self.model.load_state_dict(torch.load(checkpoint_path, map_location=dev))
+        print("✓ Loaded Best Model")
+
+        return self.train_losses, self.val_losses
+
 
     def sample(
         self,
-        num_samples: int = 100,
-        labels_to_sample: Optional[List] = None,
-        proportions: Optional[List[float]] = None,
-        cond_overrides: Optional[Dict] = None,
-        steps: int = 50,
-        cfg_scale: float = 1.5,
-        sampling_kwargs: Optional[Dict] = None,
-        device: Optional[str] = None
+        num_samples=100,
+        labels_to_sample=None,
+        proportions=None,
+        cond_overrides=None,
+        steps=50,
+        cfg_scale=1.5,
+        sampling_kwargs=None,
+        device=None
     ) -> pd.DataFrame:
-        """
-        High-level sample function that returns a pandas DataFrame with original column names (decoded).
-        - labels_to_sample: list of labels for target to sample (if target provided)
-        - proportions: list of proportions corresponding to labels_to_sample (sums to 1.0)
-        - cond_overrides: dict of additional conditioning overrides
-        """
+
         if self.model is None:
-            raise RuntimeError("Model not trained - call fit() first.")
+            raise RuntimeError("Model not trained — call fit() first.")
 
-        device = device or self.device
-        dev = torch.device(device)
+        device = torch.device(device or self.device)
 
-        sampling_kwargs = sampling_kwargs or {}
         cond_overrides = cond_overrides or {}
+        sampling_kwargs = sampling_kwargs or {}
 
-        # build per-label counts
-        if self.target is not None and labels_to_sample is not None:
-            if proportions is None:
-                # even split
-                proportions = [1.0 / len(labels_to_sample)] * len(labels_to_sample)
-            counts = [int(round(p * num_samples)) for p in proportions]
-            # adjust to sum
-            diff = num_samples - sum(counts)
-            if diff != 0:
-                counts[0] += diff
-            parts = []
-            for label_val, cnt in zip(labels_to_sample, counts):
-                # build cond_batch using overrides + setting target to label_val
-                local_overrides = dict(cond_overrides)
-                local_overrides[self.target] = int(label_val)
-                cond_batch = build_cond_batch_from_overrides(
-                    cond_specs=self.model.cond_specs,
-                    num_samples=cnt,
-                    cond_overrides=local_overrides,
-                    empirical_cond_probs=self.cond_empirical_probs,
-                    label_encoders=self.label_encoders,
-                    device=device
+        # With label-based sampling
+        if self.target and labels_to_sample:
+            proportions = proportions or [1/len(labels_to_sample)]*len(labels_to_sample)
+            counts = [round(p*num_samples) for p in proportions]
+            diff = num_samples - sum(counts); counts[0]+=diff
+
+            dfs=[]
+            for lbl, cnt in zip(labels_to_sample, counts):
+                local = dict(cond_overrides); local[self.target]=int(lbl)
+
+                cond = build_cond_batch_from_overrides(
+                    self.model.cond_specs, cnt, local,
+                    self.cond_empirical_probs, self.label_encoders, device
                 )
-                # move cond tensors to device
-                cond_batch = {k: v.to(dev) for k, v in cond_batch.items()}
-                x_num_gen, x_cat_gen = self.model.sample(cnt, cond_batch, steps=steps, cfg_scale=cfg_scale, sampling_kwargs=sampling_kwargs)
-                x_num_np = x_num_gen.detach().cpu().numpy() if x_num_gen.numel() > 0 else np.zeros((cnt, 0))
-                x_cat_np = x_cat_gen.detach().cpu().numpy() if x_cat_gen.numel() > 0 else np.zeros((cnt, 0), dtype=int)
-                df_part = decode_generated_to_df(x_num_np, x_cat_np, self.num_cols, self.cat_cols, scaler=self.scaler, label_encoders=self.label_encoders)
-                # add target column
-                if self.target is not None:
-                    df_part[self.target] = int(label_val)
-                parts.append(df_part)
-            out_df = pd.concat(parts, axis=0, ignore_index=True)
-        else:
-            # unconditional or cond_overrides only
-            cond_batch = build_cond_batch_from_overrides(
-                cond_specs=self.model.cond_specs,
-                num_samples=num_samples,
-                cond_overrides=cond_overrides,
-                empirical_cond_probs=self.cond_empirical_probs,
-                label_encoders=self.label_encoders,
-                device=device
+
+                xN,xC = self.model.sample(cnt,cond,steps,cfg_scale,sampling_kwargs)
+                dfs.append(
+                    decode_generated_to_df(xN.cpu().numpy(), xC.cpu().numpy(),
+                                           self.num_cols,self.cat_cols,
+                                           scaler=self.scaler,label_encoders=self.label_encoders)
+                )
+            df = pd.concat(dfs).reset_index(drop=True)
+
+        else: # unconditional
+            cond = build_cond_batch_from_overrides(
+                self.model.cond_specs,num_samples,cond_overrides,
+                self.cond_empirical_probs,self.label_encoders,device
             )
-            cond_batch = {k: v.to(dev) for k, v in cond_batch.items()}
-            x_num_gen, x_cat_gen = self.model.sample(num_samples, cond_batch, steps=steps, cfg_scale=cfg_scale, sampling_kwargs=sampling_kwargs)
-            x_num_np = x_num_gen.detach().cpu().numpy() if x_num_gen.numel() > 0 else np.zeros((num_samples, 0))
-            x_cat_np = x_cat_gen.detach().cpu().numpy() if x_cat_gen.numel() > 0 else np.zeros((num_samples, 0), dtype=int)
-            out_df = decode_generated_to_df(x_num_np, x_cat_np, self.num_cols, self.cat_cols, scaler=self.scaler, label_encoders=self.label_encoders)
+            xN,xC = self.model.sample(num_samples,cond,steps,cfg_scale,sampling_kwargs)
 
-        # Final sanity: clip numeric outputs to training percentiles to avoid extreme outliers
+            df = decode_generated_to_df(
+                xN.cpu().numpy(), xC.cpu().numpy(),
+                self.num_cols,self.cat_cols,
+                scaler=self.scaler,label_encoders=self.label_encoders
+            )
+
+        # limit extreme outliers for numeric stability
         for col in self.num_cols:
-            if col in out_df.columns and col in self.df_prepared.columns:
-                lo, hi = self.df_prepared[col].quantile([0.001, 0.999]).values
-                out_df[col] = out_df[col].clip(lo, hi)
+            lo,hi = self.df_prepared[col].quantile([0.001,0.999])
+            df[col]=df[col].clamp(lo,hi)
 
-        return out_df
+        return df
+
