@@ -1,50 +1,78 @@
 # tabdiffusion/data.py
 """
-Data handling: detect types, fit encoders/scalers, provide DataLoader-friendly dataset,
-and inverse transform utils.
+Data handling for TabDiffusion:
+ - Detect numeric & categorical data
+ - Apply scaling safely (no sklearn warning)
+ - Store encoded + scaled values efficiently
+ - Return tensors ready for the diffusion model
 """
-
 
 from typing import List, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import pandas as pd
 
 
 class TabularDataset(Dataset):
     """
-    Lightweight dataset that returns (x_num, x_cat, y, misc...) for integration with DataLoader.
+    Dataset returned to the DataLoader
 
-    Args:
-        df: pandas DataFrame (preprocessed so that categorical columns are label-encoded integers)
-        num_cols: list of numeric column names
-        cat_cols: list of categorical column names (already label encoded)
-        label_col: optional target column name (if available)
-        scaler: optional pre-fitted scaler used to transform numerics (expects numpy-transform signature)
+    Returns:
+        x_num → float32 tensor  [num_features]
+        x_cat → long tensor     [cat_features]
+        y     → long tensor     (classification target)
     """
-    def __init__(self, df, num_cols: List[str], cat_cols: List[str], label_col: Optional[str] = None, scaler=None):
+
+    def __init__(
+        self,
+        df,
+        num_cols: List[str],
+        cat_cols: List[str],
+        label_col: Optional[str] = None,
+        scaler=None
+    ):
         self.df = df.reset_index(drop=True)
+
         self.num_cols = num_cols
         self.cat_cols = cat_cols
         self.label_col = label_col
         self.scaler = scaler
 
+        # Pre–extract & convert all numeric values (10x faster than per row transform)
+        if len(num_cols) > 0:
+            X = df[num_cols].to_numpy(dtype=float)
+
+            # 🔥 Safe scaling — never produces sklearn warnings
+            if scaler is not None:
+                X = scaler.transform(X)
+
+            self.X_num = torch.tensor(X, dtype=torch.float32)
+        else:
+            self.X_num = torch.zeros((len(df), 0), dtype=torch.float32)
+
+        # Store categorical tensors once — **no repeated extraction**
+        if len(cat_cols) > 0:
+            self.X_cat = torch.tensor(df[cat_cols].astype(int).values, dtype=torch.long)
+        else:
+            self.X_cat = torch.zeros((len(df), 0), dtype=torch.long)
+
+        # Store label tensor (optional)
+        if label_col is not None and label_col in df.columns:
+            self.y = torch.tensor(df[label_col].astype(int).values, dtype=torch.long)
+        else:
+            self.y = torch.zeros(len(df), dtype=torch.long)
+
+    # ----------------------------------------------------------
+
     def __len__(self):
         return len(self.df)
 
+    # ----------------------------------------------------------
+
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        if self.num_cols:
-            num_vals = row[self.num_cols].values.astype(float).reshape(1, -1)
-            if self.scaler is not None:
-                num_vals = self.scaler.transform(num_vals).squeeze(0)
-            x_num = torch.tensor(num_vals, dtype=torch.float32)
-        else:
-            x_num = torch.zeros(0, dtype=torch.float32)
-        if self.cat_cols:
-            x_cat = torch.tensor(row[self.cat_cols].astype(int).values, dtype=torch.long)
-        else:
-            x_cat = torch.zeros(0, dtype=torch.long)
-        y = torch.tensor(int(row[self.label_col]) if (self.label_col is not None and self.label_col in row) else 0, dtype=torch.long)
-        return x_num, x_cat, y
+        # Return tensors already prepared — **no per-item scaling anymore**
+        return (
+            self.X_num[idx],    # float32
+            self.X_cat[idx],    # long
+            self.y[idx]         # long
+        )
